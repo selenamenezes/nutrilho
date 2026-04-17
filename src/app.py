@@ -29,16 +29,6 @@ from services.validation import (
     _build_cozinheiro_cadastro,
     registration_error_code,
 )
-from demo_constants import (
-    DEMO_BASE_VALOR,
-    DEMO_COZINHEIRO_NOME,
-    ensure_demo_cozinheiro,
-    demo_opciones_json,
-    demo_proposta_extras_json,
-    demo_valor_total_com_opcao,
-    is_demo_cozinheiro_email,
-)
-
 app = Flask(
     __name__,
     template_folder='../../web-prototype',
@@ -838,7 +828,11 @@ def pedidos_cliente_ativos():
 @app.route('/api/pedidos/cozinheiro/<int:cozinheiro_id>', methods=['GET'])
 def pedidos_do_cozinheiro(cozinheiro_id):
     """Retorna os pedidos de um cozinheiro para o painel"""
-    if 'usuario_id' not in session or session['usuario_id'] != cozinheiro_id:
+    if (
+        'usuario_id' not in session
+        or session.get('usuario_tipo') != 'cozinheiro'
+        or session['usuario_id'] != cozinheiro_id
+    ):
         return jsonify({'error': 'Não autorizado'}), 401
     
     db = SessionLocal()
@@ -1766,16 +1760,10 @@ def _serialize_solicitacao_cliente(s, db):
         proposta_pendente = {
             'id': pend.id,
             'valor': float(pend.valor),
+            'base_valor': float(pend.valor),
             'cozinheiro_nome': c.nome if c else 'Cozinheiro',
             'tipo_entrega': (c.tipo_entrega or 'Combinar retirada ou entrega') if c else '',
         }
-        if c and is_demo_cozinheiro_email(getattr(c, 'email', None)):
-            proposta_pendente['base_valor'] = float(DEMO_BASE_VALOR)
-            proposta_pendente['opciones_entrega'] = demo_opciones_json(s.id)
-            proposta_pendente['es_demo'] = True
-            proposta_pendente['tipo_entrega'] = 'Escolha uma opção de entrega abaixo.'
-            cli_sol = db.query(Cliente).filter(Cliente.id == s.cliente_id).first()
-            proposta_pendente.update(demo_proposta_extras_json(cli_sol))
     rel = s.receita_link
     if rel and not rel.startswith('/'):
         rel = f'/api/uploads/{rel}'
@@ -1911,99 +1899,14 @@ def criar_solicitacao():
         db.close()
 
 
-@app.route('/api/solicitacoes/<int:solicitacao_id>/demo-proposta', methods=['POST'])
-def solicitacao_demo_proposta(solicitacao_id):
-    """Demo: cria proposta de um cozinheiro para a solicitação (uma vez)."""
-    if 'usuario_id' not in session or session.get('usuario_tipo') != 'cliente':
-        return jsonify({'success': False, 'error': 'Não autorizado'}), 401
-
-    db = SessionLocal()
-    try:
-        cli = db.query(Cliente).filter(Cliente.id == session['usuario_id']).first()
-        s = db.query(Solicitacao).filter(Solicitacao.id == solicitacao_id).first()
-        if not s or s.cliente_id != session['usuario_id']:
-            return jsonify({'success': False, 'error': 'Solicitação não encontrada'}), 404
-        if getattr(s, 'situacao', '') == 'convertida':
-            return jsonify({
-                'success': False,
-                'error': 'Solicitação já convertida',
-                'error_code': 'SOLICITACAO_CONVERTIDA',
-            }), 400
-        if getattr(s, 'demo_convite_recusado', 0):
-            return jsonify({
-                'success': False,
-                'error': 'Convite não disponível',
-                'error_code': 'DEMO_CONVITE_INVALIDO',
-            }), 400
-        if s.situacao not in ('aguardando_cozinheiro',):
-            has_pend = (
-                db.query(Proposta)
-                .filter(Proposta.solicitacao_id == s.id, Proposta.status_ == 0)
-                .first()
-            )
-            if has_pend:
-                p = has_pend
-                c = db.query(Cozinheiro).filter(Cozinheiro.id == p.cozinheiro_id).first()
-                out = {
-                    'success': True,
-                    'ja_existia': True,
-                    'cozinheiro_nome': c.nome if c else '',
-                    'valor': float(p.valor),
-                    'tipo_entrega': (c.tipo_entrega or 'Combinar retirada ou entrega') if c else '',
-                    'proposta_id': p.id,
-                }
-                if c and is_demo_cozinheiro_email(getattr(c, 'email', None)):
-                    out['base_valor'] = float(DEMO_BASE_VALOR)
-                    out['opciones_entrega'] = demo_opciones_json(s.id)
-                    out['es_demo'] = True
-                    out.update(demo_proposta_extras_json(cli))
-                return jsonify(out)
-
-        cozinheiro = ensure_demo_cozinheiro(db)
-
-        prop = Proposta(
-            valor=DEMO_BASE_VALOR,
-            cozinheiro_id=cozinheiro.id,
-            solicitacao_id=s.id,
-            status_=0,
-            data_criacao=datetime.now(),
-        )
-        db.add(prop)
-        s.situacao = 'aguardando_cliente'
-        db.commit()
-        db.refresh(prop)
-        payload = {
-            'success': True,
-            'ja_existia': False,
-            'cozinheiro_nome': DEMO_COZINHEIRO_NOME,
-            'base_valor': float(DEMO_BASE_VALOR),
-            'valor': float(prop.valor),
-            'tipo_entrega': 'Escolha uma opção de entrega abaixo.',
-            'opciones_entrega': demo_opciones_json(s.id),
-            'es_demo': True,
-            'proposta_id': prop.id,
-        }
-        payload.update(demo_proposta_extras_json(cli))
-        return jsonify(payload)
-    except Exception as e:
-        db.rollback()
-        print(f'Erro demo-proposta: {e}')
-        import traceback
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
-    finally:
-        db.close()
-
-
 @app.route('/api/propostas/<int:proposta_id>/responder-cliente', methods=['POST'])
 def proposta_responder_cliente(proposta_id):
-    """Cliente aceita ou recusa proposta (demo). Aceitar cria Pedido."""
+    """Cliente aceita ou recusa proposta. Aceitar cria pedido."""
     if 'usuario_id' not in session or session.get('usuario_tipo') != 'cliente':
         return jsonify({'success': False, 'error': 'Não autorizado'}), 401
 
     data = request.get_json(silent=True) or {}
     aceitar = bool(data.get('aceitar'))
-    demo_entrega_opcao = (data.get('demo_entrega_opcao') or '').strip()
 
     db = SessionLocal()
     try:
@@ -2018,15 +1921,6 @@ def proposta_responder_cliente(proposta_id):
 
         if aceitar:
             coz = db.query(Cozinheiro).filter(Cozinheiro.id == prop.cozinheiro_id).first()
-            if coz and is_demo_cozinheiro_email(getattr(coz, 'email', None)):
-                total = demo_valor_total_com_opcao(demo_entrega_opcao, sol.id)
-                if total is None:
-                    return jsonify({
-                        'success': False,
-                        'error': 'Escolha uma opção de entrega válida.',
-                        'error_code': 'DEMO_ENTREGA_INVALIDA',
-                    }), 400
-                prop.valor = total
             marmita = (
                 db.query(Marmita)
                 .filter(Marmita.cozinheiro_id == prop.cozinheiro_id)
