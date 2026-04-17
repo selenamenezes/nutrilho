@@ -1,3 +1,6 @@
 .specstory/
 .cursor/
 .env
+
+# Uploads
+.src/uploads/
