@@ -29,6 +29,8 @@ from services.validation import (
     _build_cozinheiro_cadastro,
     registration_error_code,
 )
+from services.brasilapi import fetch_lat_lon_por_cep, _norm_cep
+from utils.geo import distancia_km, bucket_distancia_km
 app = Flask(
     __name__,
     template_folder='../../web-prototype',
@@ -92,6 +94,164 @@ def _migrate_solicitacoes_null_situacao():
 
 
 _migrate_solicitacoes_null_situacao()
+
+
+def _migrate_proposta_extra_columns():
+    """Adiciona colunas novas à tabela `proposta` em bases existentes (MySQL)."""
+    stmts = [
+        "ALTER TABLE proposta ADD COLUMN data_resposta DATETIME NULL",
+        "ALTER TABLE proposta ADD COLUMN tempo_entrega_min INT NULL",
+    ]
+    for stmt in stmts:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception as e:
+            low = str(e).lower()
+            if 'duplicate' in low or '1060' in str(e):
+                continue
+            print(f'[migrate proposta] {e}')
+
+
+_migrate_proposta_extra_columns()
+
+
+def _migrate_cozinheiro_entrega_columns():
+    """Colunas de configuração de entrega no cozinheiro (PLAN_USUARIO §9.2)."""
+    stmts = [
+        "ALTER TABLE cozinheiros ADD COLUMN taxa_motoboy DECIMAL(8,2) NULL",
+        "ALTER TABLE cozinheiros ADD COLUMN aceita_parceiros TINYINT(1) NOT NULL DEFAULT 0",
+        "ALTER TABLE cozinheiros ADD COLUMN taxa_parceiros DECIMAL(8,2) NULL",
+    ]
+    for stmt in stmts:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception as e:
+            low = str(e).lower()
+            if 'duplicate' in low or '1060' in str(e):
+                continue
+            print(f'[migrate cozinheiros] {e}')
+
+
+_migrate_cozinheiro_entrega_columns()
+
+
+def _migrate_pedido_entrega_columns():
+    """Colunas da entrega escolhida pelo cliente (PLAN_USUARIO §9.2)."""
+    stmts = [
+        "ALTER TABLE pedidos ADD COLUMN entrega_opcao VARCHAR(32) NULL",
+        "ALTER TABLE pedidos ADD COLUMN taxa_entrega DECIMAL(8,2) NULL",
+        "ALTER TABLE pedidos ADD COLUMN tempo_entrega_min INT NULL",
+    ]
+    for stmt in stmts:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception as e:
+            low = str(e).lower()
+            if 'duplicate' in low or '1060' in str(e):
+                continue
+            print(f'[migrate pedidos] {e}')
+
+
+_migrate_pedido_entrega_columns()
+
+
+def _migrate_geo_columns():
+    """Colunas de geolocalização no cliente e no cozinheiro (PLAN §10/§11).
+
+    Populadas a partir de BrasilAPI/CEP. Idempotente — ignora `1060/duplicate`.
+    """
+    stmts = [
+        "ALTER TABLE cozinheiros ADD COLUMN latitude DECIMAL(10,7) NULL",
+        "ALTER TABLE cozinheiros ADD COLUMN longitude DECIMAL(10,7) NULL",
+        "ALTER TABLE cozinheiros ADD COLUMN geo_cep_ref VARCHAR(16) NULL",
+        "ALTER TABLE cozinheiros ADD COLUMN geo_atualizado_em DATETIME NULL",
+        "ALTER TABLE cliente ADD COLUMN latitude DECIMAL(10,7) NULL",
+        "ALTER TABLE cliente ADD COLUMN longitude DECIMAL(10,7) NULL",
+        "ALTER TABLE cliente ADD COLUMN geo_cep_ref VARCHAR(16) NULL",
+        "ALTER TABLE cliente ADD COLUMN geo_atualizado_em DATETIME NULL",
+    ]
+    for stmt in stmts:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception as e:
+            low = str(e).lower()
+            if 'duplicate' in low or '1060' in str(e):
+                continue
+            print(f'[migrate geo] {e}')
+
+
+_migrate_geo_columns()
+
+
+def _migrate_pedido_pagamento_columns():
+    """Colunas do checkout fake no pedido (PLAN_USUARIO §12)."""
+    stmts = [
+        "ALTER TABLE pedidos ADD COLUMN status_pagamento VARCHAR(16) NOT NULL DEFAULT 'pendente'",
+        "ALTER TABLE pedidos ADD COLUMN metodo_pagamento VARCHAR(16) NULL",
+        "ALTER TABLE pedidos ADD COLUMN pix_copia_cola VARCHAR(255) NULL",
+        "ALTER TABLE pedidos ADD COLUMN pagamento_data DATETIME NULL",
+    ]
+    for stmt in stmts:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception as e:
+            low = str(e).lower()
+            if 'duplicate' in low or '1060' in str(e):
+                continue
+            print(f'[migrate pagamento] {e}')
+
+
+_migrate_pedido_pagamento_columns()
+
+
+def _ensure_geo_for_user(db, user) -> bool:
+    """Garante que `user.latitude/longitude` reflete o `user.cep` atual.
+
+    Refetcha BrasilAPI quando:
+      - `geo_cep_ref` é diferente do CEP atual (usuário mudou endereço);
+      - `latitude/longitude` estão NULL (conta antiga sem geo).
+
+    Retorna `True` quando escreveu algo no `user`. O commit é
+    responsabilidade do chamador — se o caller já está num contexto
+    transacional (ex.: PUT /api/perfil), evita flushes parciais.
+
+    Best-effort: qualquer falha em BrasilAPI só marca `geo_cep_ref` para
+    não ficar tentando a cada request (`fetch_lat_lon_por_cep` já tem
+    cache próprio). Nunca levanta exceção.
+    """
+    if user is None:
+        return False
+    cep_atual = _norm_cep(getattr(user, 'cep', None))
+    if not cep_atual:
+        return False
+    cep_ref = _norm_cep(getattr(user, 'geo_cep_ref', None))
+    ja_tem_coords = (
+        getattr(user, 'latitude', None) is not None
+        and getattr(user, 'longitude', None) is not None
+    )
+    if ja_tem_coords and cep_ref == cep_atual:
+        return False
+    try:
+        coords = fetch_lat_lon_por_cep(cep_atual)
+    except Exception as e:
+        print(f'[geo] BrasilAPI lookup failed: {e}')
+        coords = None
+    agora = datetime.now()
+    if coords is not None:
+        lat, lon = coords
+        user.latitude = Decimal(str(lat))
+        user.longitude = Decimal(str(lon))
+    else:
+        user.latitude = None
+        user.longitude = None
+    user.geo_cep_ref = cep_atual
+    user.geo_atualizado_em = agora
+    return True
 
 
 def _safe_int(v, default=None):
@@ -392,6 +552,12 @@ def api_register_cliente():
             db.rollback()
             return _register_integrity_response(ie)
         db.refresh(novo)
+        try:
+            if _ensure_geo_for_user(db, novo):
+                db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f'[register cliente] geo falhou: {e}')
         session['usuario_id'] = novo.id
         session['usuario_tipo'] = 'cliente'
         session['usuario_nome'] = novo.nome
@@ -435,6 +601,12 @@ def api_register_cozinheiro():
             db.rollback()
             return _register_integrity_response(ie)
         db.refresh(novo)
+        try:
+            if _ensure_geo_for_user(db, novo):
+                db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f'[register cozinheiro] geo falhou: {e}')
         session['usuario_id'] = novo.id
         session['usuario_tipo'] = 'cozinheiro'
         session['usuario_nome'] = novo.nome
@@ -481,6 +653,14 @@ def login():
             session['usuario_tipo'] = 'cliente'
             session['usuario_nome'] = usuario.nome
             session['usuario_email'] = usuario.email
+            # Backfill oportunístico de geo p/ contas antigas sem lat/lon
+            # (`PLAN §10/§11`). Falhas são ignoradas.
+            try:
+                if _ensure_geo_for_user(db, usuario):
+                    db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f'[login] geo backfill cliente falhou: {e}')
             
             return jsonify({
                 'success': True,
@@ -501,6 +681,12 @@ def login():
             session['usuario_tipo'] = 'cozinheiro'
             session['usuario_nome'] = usuario.nome
             session['usuario_email'] = usuario.email
+            try:
+                if _ensure_geo_for_user(db, usuario):
+                    db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f'[login] geo backfill cozinheiro falhou: {e}')
             
             return jsonify({
                 'success': True,
@@ -544,7 +730,11 @@ def logout():
 # ============ API: LISTAR COZINHEIROS ============
 @app.route('/api/cozinheiros', methods=['GET'])
 def listar_cozinheiros():
-    """Retorna lista de cozinheiros para o marketplace"""
+    """Retorna lista de cozinheiros para o marketplace.
+
+    Inclui `distancia_km` (precisa) quando o cliente logado tem
+    `latitude/longitude` populados — caso contrário, `null`. Ver PLAN §10.
+    """
     db = SessionLocal()
     try:
         especialidade_filtro = request.args.get('especialidade')
@@ -555,6 +745,21 @@ def listar_cozinheiros():
         
         cozinheiros = query.all()
         
+        # Origem para cálculo de distância: cliente logado (se houver).
+        origem = None
+        if session.get('usuario_tipo') == 'cliente' and session.get('usuario_id'):
+            cli = db.query(Cliente).filter(Cliente.id == session['usuario_id']).first()
+            if cli is not None:
+                # Tenta backfill oportunístico — já dá pra usar nesta resposta.
+                try:
+                    if _ensure_geo_for_user(db, cli):
+                        db.commit()
+                except Exception as e:
+                    db.rollback()
+                    print(f'[marketplace] geo backfill falhou: {e}')
+                if cli.latitude is not None and cli.longitude is not None:
+                    origem = (cli.latitude, cli.longitude)
+
         resultado = []
         for c in cozinheiros:
             # Calcular média de avaliações
@@ -563,7 +768,11 @@ def listar_cozinheiros():
                 Pedido.cozinheiro_id == c.id,
                 Pedido.avaliacao > 0
             ).scalar() or 0
-            
+
+            d_km = None
+            if origem is not None and c.latitude is not None and c.longitude is not None:
+                d_km = distancia_km(origem[0], origem[1], c.latitude, c.longitude)
+
             resultado.append({
                 'id': c.id,
                 'nome': c.nome,
@@ -574,7 +783,8 @@ def listar_cozinheiros():
                 'sobre': c.sobre_voce,
                 'foto': c.foto_link,
                 'telefone': c.telefone,
-                'tipo_entrega': c.tipo_entrega
+                'tipo_entrega': c.tipo_entrega,
+                'distancia_km': d_km,
             })
         
         return jsonify(resultado)
@@ -753,6 +963,8 @@ def pedidos_do_cliente(cliente_id):
                         'receita_link': proposta.solicitacao.receita_link if proposta.solicitacao else None
                     }
             
+            entrega_opcao = getattr(p, 'entrega_opcao', None)
+            taxa_entrega = getattr(p, 'taxa_entrega', None)
             resultado.append({
                 'id': p.id,
                 'cozinheiro_nome': p.cozinheiro.nome if p.cozinheiro else 'Desconhecido',
@@ -766,7 +978,13 @@ def pedidos_do_cliente(cliente_id):
                 'marmita_nome': _marmita_nome_listagem(p.marmita),
                 'proposta_id': p.proposta_id,
                 'proposta': proposta_info,
-                'pode_avaliar': p.status == 'entregue' and p.avaliacao == 0
+                'pode_avaliar': p.status == 'entregue' and p.avaliacao == 0,
+                'entrega_opcao': entrega_opcao,
+                'entrega_label': _label_entrega(entrega_opcao),
+                'taxa_entrega': float(taxa_entrega) if taxa_entrega is not None else None,
+                'tempo_entrega_min': getattr(p, 'tempo_entrega_min', None),
+                'status_pagamento': getattr(p, 'status_pagamento', None) or 'pendente',
+                'metodo_pagamento': getattr(p, 'metodo_pagamento', None),
             })
         
         return jsonify(resultado)
@@ -817,6 +1035,8 @@ def pedidos_cliente_ativos():
                 'marmita_nome': p.marmita.nome if p.marmita else 'Marmita Padrão',
                 'proposta_id': p.proposta_id,
                 'proposta': proposta_info,
+                'status_pagamento': getattr(p, 'status_pagamento', None) or 'pendente',
+                'metodo_pagamento': getattr(p, 'metodo_pagamento', None),
             })
 
         return jsonify(resultado)
@@ -853,6 +1073,8 @@ def pedidos_do_cozinheiro(cozinheiro_id):
                         'receita_link': proposta.solicitacao.receita_link if proposta.solicitacao else None
                     }
             
+            entrega_opcao = getattr(p, 'entrega_opcao', None)
+            taxa_entrega = getattr(p, 'taxa_entrega', None)
             resultado.append({
                 'id': p.id,
                 'cliente_nome': p.cliente.nome if p.cliente else 'Cliente',
@@ -864,7 +1086,11 @@ def pedidos_do_cozinheiro(cozinheiro_id):
                 'avaliacao': p.avaliacao,
                 'proposta_id': p.proposta_id,
                 'proposta': proposta_info,
-                'endereco_entrega': f"{p.cliente.rua}, {p.cliente.numero} - {p.cliente.complemento if p.cliente.complemento else ''}".strip()
+                'endereco_entrega': f"{p.cliente.rua}, {p.cliente.numero} - {p.cliente.complemento if p.cliente.complemento else ''}".strip(),
+                'entrega_opcao': entrega_opcao,
+                'entrega_label': _label_entrega(entrega_opcao),
+                'taxa_entrega': float(taxa_entrega) if taxa_entrega is not None else None,
+                'tempo_entrega_min': getattr(p, 'tempo_entrega_min', None),
             })
         
         return jsonify(resultado)
@@ -874,23 +1100,42 @@ def pedidos_do_cozinheiro(cozinheiro_id):
 # ============ API: ATUALIZAR STATUS DO PEDIDO ============
 @app.route('/api/pedidos/<int:pedido_id>/status', methods=['PUT'])
 def atualizar_status_pedido(pedido_id):
-    """Atualiza o status de um pedido"""
+    """Atualiza o status de um pedido.
+
+    Regras:
+    - Cozinheiro dono do pedido pode mover para qualquer status (como antes).
+    - Cliente dono pode **apenas** confirmar a entrega: transição
+      `saiu_entrega → entregue`. Qualquer outra tentativa do cliente
+      retorna 403. Isso habilita o botão "Confirmar entrega" do app
+      sem abrir mão do controle do cozinheiro.
+    """
     db = SessionLocal()
     try:
-        data = request.json
+        data = request.json or {}
         status = data.get('status')
-        
+
         pedido = db.query(Pedido).filter(Pedido.id == pedido_id).first()
-        
+
         if not pedido:
             return jsonify({'error': 'Pedido não encontrado'}), 404
-        
-        if session.get('usuario_tipo') != 'cozinheiro' or session['usuario_id'] != pedido.cozinheiro_id:
+
+        usuario_tipo = session.get('usuario_tipo')
+        usuario_id = session.get('usuario_id')
+
+        if usuario_tipo == 'cozinheiro' and usuario_id == pedido.cozinheiro_id:
+            pass
+        elif usuario_tipo == 'cliente' and usuario_id == pedido.cliente_id:
+            if not (pedido.status == 'saiu_entrega' and status == 'entregue'):
+                return jsonify({
+                    'error': 'Cliente só pode confirmar entrega de um pedido em saiu_entrega.',
+                    'status_atual': pedido.status,
+                }), 403
+        else:
             return jsonify({'error': 'Não autorizado'}), 401
-        
+
         pedido.status = status
         db.commit()
-        
+
         return jsonify({'success': True, 'status': status})
     except Exception as e:
         db.rollback()
@@ -1094,6 +1339,8 @@ def get_perfil():
             if not usuario:
                 return jsonify({'error': 'Usuário não encontrado'}), 404
             
+            taxa_motoboy = getattr(usuario, 'taxa_motoboy', None)
+            taxa_parceiros = getattr(usuario, 'taxa_parceiros', None)
             return jsonify({
                 'id': usuario.id,
                 'nome': usuario.nome,
@@ -1106,6 +1353,9 @@ def get_perfil():
                 'sobre_voce': usuario.sobre_voce,
                 'tipo_entrega': usuario.tipo_entrega,
                 'especialidade_id': usuario.especialidade_id,
+                'taxa_motoboy': float(taxa_motoboy) if taxa_motoboy is not None else None,
+                'aceita_parceiros': bool(getattr(usuario, 'aceita_parceiros', False)),
+                'taxa_parceiros': float(taxa_parceiros) if taxa_parceiros is not None else None,
                 'tipo': 'cozinheiro'
             })
     finally:
@@ -1152,7 +1402,13 @@ def atualizar_perfil():
                 if not valido:
                     return jsonify({'error': senha_hash}), 400
                 usuario.senha = senha_hash
-            
+
+            # Re-geocoda se o CEP mudou (PLAN §10).
+            try:
+                _ensure_geo_for_user(db, usuario)
+            except Exception as e:
+                print(f'[perfil cliente] geo falhou: {e}')
+
             db.commit()
             
             # Atualizar sessão
@@ -1186,18 +1442,51 @@ def atualizar_perfil():
             if 'tipo_entrega' in data:
                 usuario.tipo_entrega = data['tipo_entrega']
             if 'especialidade_id' in data:
-                # Verificar se especialidade existe
                 especialidade = db.query(Especialidade).filter(Especialidade.id == data['especialidade_id']).first()
                 if especialidade:
                     usuario.especialidade_id = especialidade.id
-            
+            # Config de entrega (PLAN_USUARIO §9.2).
+            # Aceita explicitamente `null` p/ "não oferece essa forma".
+            if 'taxa_motoboy' in data:
+                v = data['taxa_motoboy']
+                if v is None:
+                    usuario.taxa_motoboy = None
+                else:
+                    try:
+                        val = Decimal(str(v))
+                    except Exception:
+                        return jsonify({'error': 'taxa_motoboy inválida'}), 400
+                    if val < 0:
+                        return jsonify({'error': 'taxa_motoboy não pode ser negativa'}), 400
+                    usuario.taxa_motoboy = val
+            if 'aceita_parceiros' in data:
+                usuario.aceita_parceiros = bool(data['aceita_parceiros'])
+            if 'taxa_parceiros' in data:
+                v = data['taxa_parceiros']
+                if v is None:
+                    usuario.taxa_parceiros = None
+                else:
+                    try:
+                        val = Decimal(str(v))
+                    except Exception:
+                        return jsonify({'error': 'taxa_parceiros inválida'}), 400
+                    if val < 0:
+                        return jsonify({'error': 'taxa_parceiros não pode ser negativa'}), 400
+                    usuario.taxa_parceiros = val
+
             # Atualizar senha se fornecida
             if 'senha' in data and data['senha']:
                 valido, senha_hash = validar_senha(data['senha'])
                 if not valido:
                     return jsonify({'error': senha_hash}), 400
                 usuario.senha = senha_hash
-            
+
+            # Re-geocoda se o CEP mudou (PLAN §11).
+            try:
+                _ensure_geo_for_user(db, usuario)
+            except Exception as e:
+                print(f'[perfil cozinheiro] geo falhou: {e}')
+
             db.commit()
             
             # Atualizar sessão
@@ -1352,51 +1641,219 @@ def deletar_marmita(marmita_id):
 # ============ API: CRIAR PROPOSTA ============
 @app.route('/api/propostas', methods=['POST'])
 def criar_proposta():
-    """Cria uma nova proposta para uma receita"""
+    """Cria uma nova proposta para uma solicitação.
+
+    Regras:
+      - Apenas cozinheiros autenticados.
+      - `solicitacao_id` obrigatório e deve existir.
+      - `Solicitacao.situacao` deve ser `aguardando_cozinheiro`
+        (rejeita `convertida`, `recusada_cliente`, etc.).
+      - Não permite duas propostas pendentes do mesmo cozinheiro para
+        a mesma solicitação (409).
+      - `valor` deve ser numérico e > 0.
+    """
     if 'usuario_id' not in session or session.get('usuario_tipo') != 'cozinheiro':
         return jsonify({'error': 'Não autorizado'}), 401
-    
+
+    data = request.get_json(silent=True) or {}
+    solicitacao_id = data.get('solicitacao_id')
+    if solicitacao_id is None:
+        return jsonify({'error': 'solicitacao_id é obrigatório'}), 400
+    try:
+        solicitacao_id = int(solicitacao_id)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'solicitacao_id inválido'}), 400
+
+    try:
+        valor = Decimal(str(data.get('valor')))
+    except Exception:
+        return jsonify({'error': 'valor inválido'}), 400
+    if valor <= 0:
+        return jsonify({'error': 'valor deve ser maior que zero'}), 400
+
+    # tempo_entrega_min: obrigatório quando o cozinheiro oferece moto-boy
+    # (`Cozinheiro.taxa_motoboy IS NOT NULL`), ignorado caso contrário.
+    # Validação do intervalo (5..240 min) vale em ambos os casos quando informado.
+    tempo_entrega_min_raw = data.get('tempo_entrega_min')
+    tempo_entrega_min = None
+    if tempo_entrega_min_raw is not None and tempo_entrega_min_raw != '':
+        try:
+            tempo_entrega_min = int(tempo_entrega_min_raw)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'tempo_entrega_min inválido'}), 400
+        if tempo_entrega_min < 5 or tempo_entrega_min > 240:
+            return jsonify({
+                'error': 'tempo_entrega_min deve estar entre 5 e 240 minutos.',
+            }), 400
+
+    cozinheiro_id = session['usuario_id']
+
     db = SessionLocal()
     try:
-        data = request.json
-        
-        #nova_proposta = Proposta(
-        #    valor=Decimal(str(data['valor'])),
-        #    cozinheiro_id=session['usuario_id'],
-        #    data_criacao=datetime.now(),
-        #    receita_link=data.get('receita_link')
-        #)
-        nova_proposta = Proposta(
-            valor=Decimal(str(data['valor'])),
-            cozinheiro_id=session['usuario_id'],
-            solicitacao_id=data['solicitacao_id'],  # OBRIGATÓRIO AGORA
-            status_=0,
-            data_criacao=datetime.now()
+        sol = db.query(Solicitacao).filter(Solicitacao.id == solicitacao_id).first()
+        if not sol:
+            return jsonify({'error': 'Solicitação não encontrada'}), 404
+
+        cozinheiro_logado = (
+            db.query(Cozinheiro).filter(Cozinheiro.id == cozinheiro_id).first()
         )
-        
+        oferece_motoboy = (
+            cozinheiro_logado is not None
+            and getattr(cozinheiro_logado, 'taxa_motoboy', None) is not None
+        )
+        if oferece_motoboy and tempo_entrega_min is None:
+            return jsonify({
+                'error': 'Informe o tempo estimado de entrega (moto-boy).',
+                'field': 'tempo_entrega_min',
+            }), 400
+        if not oferece_motoboy:
+            tempo_entrega_min = None
+
+        situacao_atual = getattr(sol, 'situacao', None) or 'aguardando_cozinheiro'
+        if situacao_atual != 'aguardando_cozinheiro':
+            return jsonify({
+                'error': 'Esta solicitação não está mais disponível.',
+                'situacao': situacao_atual,
+            }), 400
+
+        # MVP (opção A): múltiplos cozinheiros podem enviar proposta em paralelo,
+        # mas cada cozinheiro só pode ter UMA proposta pendente por solicitação.
+        ja_minha = (
+            db.query(Proposta)
+            .filter(
+                Proposta.solicitacao_id == solicitacao_id,
+                Proposta.cozinheiro_id == cozinheiro_id,
+                Proposta.status_ == 0,
+            )
+            .first()
+        )
+        if ja_minha:
+            return jsonify({
+                'error': 'Você já enviou uma proposta para esta solicitação.',
+                'proposta_id': ja_minha.id,
+            }), 409
+
+        nova_proposta = Proposta(
+            valor=valor,
+            cozinheiro_id=cozinheiro_id,
+            solicitacao_id=solicitacao_id,
+            status_=0,
+            data_criacao=datetime.now(),
+            tempo_entrega_min=tempo_entrega_min,
+        )
+
         db.add(nova_proposta)
         db.commit()
         db.refresh(nova_proposta)
-        
+
         return jsonify({
             'success': True,
             'proposta': {
                 'id': nova_proposta.id,
                 'valor': float(nova_proposta.valor),
                 'status': nova_proposta.status_,
+                'solicitacao_id': nova_proposta.solicitacao_id,
                 'data_criacao': nova_proposta.data_criacao.strftime('%d/%m/%Y %H:%M'),
-                'receita_link': nova_proposta.solicitacao.receita_link if nova_proposta.solicitacao else None
-            }
+                'tempo_entrega_min': nova_proposta.tempo_entrega_min,
+                'receita_link': nova_proposta.solicitacao.receita_link if nova_proposta.solicitacao else None,
+            },
         })
     except Exception as e:
         db.rollback()
         print(f"Erro ao criar proposta: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         db.close()
 
 
 # ============ API: LISTAR PROPOSTAS DO COZINHEIRO ============
+@app.route('/api/cozinheiro/propostas', methods=['GET'])
+def listar_propostas_do_cozinheiro_logado():
+    """Inbox do cozinheiro: suas próprias propostas filtradas por status.
+
+    Query params:
+    - `status` ∈ {pendente, aceita, recusada, todas} ou {0,1,2}; default todas.
+    - `desde` (ISO date/datetime); filtra `data_criacao >= desde`.
+    - `limit` (int, default 50, máx 100); `offset` (int, default 0).
+
+    Auth: sessão cozinheiro obrigatória (401 caso contrário).
+    PII: `cliente_nome` reduzido via `_primeiro_nome`.
+    """
+    if session.get('usuario_tipo') != 'cozinheiro' or 'usuario_id' not in session:
+        return jsonify({'error': 'Não autorizado'}), 401
+
+    cozinheiro_id = session['usuario_id']
+    status_raw = (request.args.get('status') or 'todas').strip().lower()
+    status_map = {
+        'pendente': 0, '0': 0,
+        'aceita': 1, '1': 1,
+        'recusada': 2, '2': 2,
+        'todas': None, '': None,
+    }
+    if status_raw not in status_map:
+        return jsonify({'error': "Parâmetro 'status' inválido (use pendente/aceita/recusada/todas)."}), 400
+    status_filtro = status_map[status_raw]
+
+    limit = _safe_int(request.args.get('limit'), 50) or 50
+    offset = _safe_int(request.args.get('offset'), 0) or 0
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+
+    desde_raw = (request.args.get('desde') or '').strip()
+    desde_dt = None
+    if desde_raw:
+        for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+            try:
+                desde_dt = datetime.strptime(desde_raw, fmt)
+                break
+            except ValueError:
+                continue
+        if desde_dt is None:
+            return jsonify({'error': "Parâmetro 'desde' inválido (use ISO date ou datetime)."}), 400
+
+    db = SessionLocal()
+    try:
+        q = db.query(Proposta).filter(Proposta.cozinheiro_id == cozinheiro_id)
+        if status_filtro is not None:
+            q = q.filter(Proposta.status_ == status_filtro)
+        if desde_dt is not None:
+            q = q.filter(Proposta.data_criacao >= desde_dt)
+        total = q.count()
+        props = q.order_by(Proposta.data_criacao.desc()).limit(limit).offset(offset).all()
+
+        def _status_texto(s):
+            return 'Pendente' if s == 0 else 'Aceita' if s == 1 else 'Recusada'
+
+        def _data_resposta(p):
+            if p.status_ == 0:
+                return None
+            ref = getattr(p, 'data_resposta', None) or (p.data_aceita if p.status_ == 1 else None)
+            return ref.strftime('%d/%m/%Y %H:%M') if ref else None
+
+        out = []
+        for p in props:
+            sol = p.solicitacao
+            cliente_nome = _primeiro_nome(sol.cliente.nome if sol and sol.cliente else '')
+            out.append({
+                'id': p.id,
+                'solicitacao_id': p.solicitacao_id,
+                'cliente_nome': cliente_nome,
+                'valor': float(p.valor),
+                'status': p.status_,
+                'status_texto': _status_texto(p.status_),
+                'data_criacao': p.data_criacao.strftime('%d/%m/%Y %H:%M') if p.data_criacao else None,
+                'data_criacao_iso': p.data_criacao.isoformat() if p.data_criacao else None,
+                'data_resposta_cliente': _data_resposta(p),
+                'tempo_entrega_min': getattr(p, 'tempo_entrega_min', None),
+            })
+
+        return jsonify({'propostas': out, 'total': total, 'limit': limit, 'offset': offset})
+    finally:
+        db.close()
+
+
 @app.route('/api/propostas/cozinheiro/<int:cozinheiro_id>', methods=['GET'])
 def listar_propostas_cozinheiro(cozinheiro_id):
     """Retorna todas as propostas de um cozinheiro"""
@@ -1728,6 +2185,9 @@ def _serialize_pedido_ativo_cliente(p, db):
                 'valor': float(proposta.valor),
                 'receita_link': sol.receita_link if sol else None,
             }
+    entrega_opcao = getattr(p, 'entrega_opcao', None)
+    taxa_entrega = getattr(p, 'taxa_entrega', None)
+    tempo_entrega_min = getattr(p, 'tempo_entrega_min', None)
     return {
         'tipo': 'pedido',
         'id': p.id,
@@ -1743,7 +2203,71 @@ def _serialize_pedido_ativo_cliente(p, db):
         'marmita_nome': _marmita_nome_listagem(p.marmita),
         'proposta_id': p.proposta_id,
         'proposta': proposta_info,
+        'entrega_opcao': entrega_opcao,
+        'entrega_label': _label_entrega(entrega_opcao),
+        'taxa_entrega': float(taxa_entrega) if taxa_entrega is not None else None,
+        'tempo_entrega_min': tempo_entrega_min,
+        'status_pagamento': getattr(p, 'status_pagamento', None) or 'pendente',
+        'metodo_pagamento': getattr(p, 'metodo_pagamento', None),
     }
+
+
+ENTREGA_OPCAO_IDS = ('retirada', 'motoboy', 'uber', 'parceiros')
+ENTREGA_LABELS = {
+    'retirada': 'Retirada no local',
+    'motoboy': 'Delivery Moto boy',
+    'uber': 'Uber',
+    'parceiros': 'Parceiros (iFood/Rappi)',
+}
+# Estimativa Uber no MVP — placeholder até termos tabela real por CEP / Distance Matrix.
+UBER_ESTIMATIVA_MVP_BRL = 12.0
+
+
+def _label_entrega(op_id):
+    if not op_id:
+        return None
+    return ENTREGA_LABELS.get(op_id, op_id)
+
+
+def _construir_opciones_entrega(c, prop):
+    """Monta a lista de formas de entrega para `proposta_pendente`.
+
+    Retirada sempre é oferecida e sem frete. As demais dependem da
+    configuração do cozinheiro (`taxa_motoboy`, `aceita_parceiros`,
+    `tipo_entrega`). Ver `PLAN_USUARIO.md §9.2` para o contrato.
+    """
+    out = [{
+        'id': 'retirada',
+        'label': 'Retirada no local',
+        'taxa': 0.0,
+    }]
+    if c is None:
+        return out
+    tipo = (getattr(c, 'tipo_entrega', '') or '').strip().lower()
+    oferece_delivery = tipo in ('delivery', 'ambos', 'entrega', 'motoboy')
+    if not oferece_delivery:
+        return out
+
+    taxa_motoboy = getattr(c, 'taxa_motoboy', None)
+    if taxa_motoboy is not None:
+        out.append({
+            'id': 'motoboy',
+            'label': 'Delivery Moto boy',
+            'taxa': float(taxa_motoboy),
+        })
+    out.append({
+        'id': 'uber',
+        'label': 'Uber',
+        'taxa': UBER_ESTIMATIVA_MVP_BRL,
+        'estimativa': True,
+    })
+    if bool(getattr(c, 'aceita_parceiros', False)):
+        out.append({
+            'id': 'parceiros',
+            'label': 'Parceiros (iFood/Rappi)',
+            'taxa': float(getattr(c, 'taxa_parceiros', 0) or 0),
+        })
+    return out
 
 
 def _serialize_solicitacao_cliente(s, db):
@@ -1757,12 +2281,29 @@ def _serialize_solicitacao_cliente(s, db):
     )
     if pend:
         c = db.query(Cozinheiro).filter(Cozinheiro.id == pend.cozinheiro_id).first()
+        opciones = _construir_opciones_entrega(c, pend)
+        # Distância precisa cozinheiro → cliente para UX do modal (PLAN §10).
+        d_km = None
+        cliente_obj = (
+            db.query(Cliente).filter(Cliente.id == s.cliente_id).first() if s else None
+        )
+        if c and cliente_obj:
+            d_km = distancia_km(
+                cliente_obj.latitude,
+                cliente_obj.longitude,
+                c.latitude,
+                c.longitude,
+            )
         proposta_pendente = {
             'id': pend.id,
             'valor': float(pend.valor),
             'base_valor': float(pend.valor),
+            'cozinheiro_id': pend.cozinheiro_id,
             'cozinheiro_nome': c.nome if c else 'Cozinheiro',
             'tipo_entrega': (c.tipo_entrega or 'Combinar retirada ou entrega') if c else '',
+            'opciones_entrega': opciones,
+            'tempo_entrega_min': getattr(pend, 'tempo_entrega_min', None),
+            'distancia_km': d_km,
         }
     rel = s.receita_link
     if rel and not rel.startswith('/'):
@@ -1907,6 +2448,7 @@ def proposta_responder_cliente(proposta_id):
 
     data = request.get_json(silent=True) or {}
     aceitar = bool(data.get('aceitar'))
+    entrega_opcao_raw = data.get('entregaOpcao') or data.get('entrega_opcao')
 
     db = SessionLocal()
     try:
@@ -1921,6 +2463,42 @@ def proposta_responder_cliente(proposta_id):
 
         if aceitar:
             coz = db.query(Cozinheiro).filter(Cozinheiro.id == prop.cozinheiro_id).first()
+            opciones = _construir_opciones_entrega(coz, prop)
+            opciones_ids = {op['id'] for op in opciones}
+
+            # Quando o cozinheiro ofereceu mais de uma opção, o cliente é
+            # obrigado a escolher explicitamente; caso contrário assume
+            # retirada.
+            entrega_opcao = (entrega_opcao_raw or '').strip().lower() or None
+            if entrega_opcao is None:
+                if len(opciones) > 1:
+                    return jsonify({
+                        'success': False,
+                        'error': 'Escolha a forma de entrega antes de aceitar.',
+                        'field': 'entregaOpcao',
+                    }), 400
+                entrega_opcao = 'retirada'
+
+            if entrega_opcao not in ENTREGA_OPCAO_IDS:
+                return jsonify({
+                    'success': False,
+                    'error': 'Forma de entrega inválida.',
+                    'field': 'entregaOpcao',
+                }), 400
+            if entrega_opcao not in opciones_ids:
+                return jsonify({
+                    'success': False,
+                    'error': 'Esta forma de entrega não está disponível para esta proposta.',
+                    'field': 'entregaOpcao',
+                }), 400
+
+            op_escolhida = next(op for op in opciones if op['id'] == entrega_opcao)
+            taxa_entrega = Decimal(str(op_escolhida.get('taxa', 0)))
+            val_total = prop.valor + taxa_entrega
+            tempo_entrega_min_out = (
+                prop.tempo_entrega_min if entrega_opcao == 'motoboy' else None
+            )
+
             marmita = (
                 db.query(Marmita)
                 .filter(Marmita.cozinheiro_id == prop.cozinheiro_id)
@@ -1936,29 +2514,259 @@ def proposta_responder_cliente(proposta_id):
                 status='confirmado',
                 horario=datetime.now(),
                 qtd_marmitas=qtd,
-                val_total=prop.valor,
+                val_total=val_total,
                 marmita_id=marmita.id if marmita else None,
                 proposta_id=prop.id,
                 plano_id=plano_id,
                 avaliacao=0,
+                entrega_opcao=entrega_opcao,
+                taxa_entrega=taxa_entrega,
+                tempo_entrega_min=tempo_entrega_min_out,
             )
             db.add(pedido)
+            db.flush()  # precisamos do pedido.id para devolver ao checkout
             prop.status_ = 1
-            prop.data_aceita = datetime.now()
+            now = datetime.now()
+            prop.data_aceita = now
+            prop.data_resposta = now
             sol.situacao = 'convertida'
+            pedido_id_out = pedido.id
         else:
             prop.status_ = 2
+            prop.data_resposta = datetime.now()
             sol.situacao = 'recusada_cliente'
             sol.demo_convite_recusado = 1
+            pedido_id_out = None
 
         db.commit()
-        return jsonify({'success': True, 'aceitar': aceitar})
+        return jsonify({'success': True, 'aceitar': aceitar, 'pedido_id': pedido_id_out})
     except Exception as e:
         db.rollback()
         print(f'Erro responder proposta: {e}')
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+# ============ API: SOLICITAÇÕES ABERTAS (cozinheiro) ============
+def _primeiro_nome(nome_completo: str) -> str:
+    """Primeiro nome + inicial do último sobrenome (ex.: 'Maria S.').
+    Evita expor o nome completo do cliente na fase de descoberta."""
+    if not nome_completo:
+        return 'Cliente'
+    partes = [p for p in nome_completo.strip().split() if p]
+    if not partes:
+        return 'Cliente'
+    if len(partes) == 1:
+        return partes[0]
+    return f'{partes[0]} {partes[-1][0].upper()}.'
+
+
+def _serialize_solicitacao_aberta(s, db, cozinheiro_id):
+    """View da solicitação para o painel do cozinheiro (sem PII sensível).
+
+    `cliente_distancia_bucket` (PLAN §11) é um bucket categórico; nunca
+    exponha `distancia_km` precisa aqui para não vazar o endereço do
+    cliente antes do aceite da proposta.
+    """
+    total_propostas = (
+        db.query(Proposta).filter(Proposta.solicitacao_id == s.id).count()
+    )
+    minha = (
+        db.query(Proposta)
+        .filter(
+            Proposta.solicitacao_id == s.id,
+            Proposta.cozinheiro_id == cozinheiro_id,
+        )
+        .order_by(Proposta.data_criacao.desc())
+        .first()
+    )
+    rel = s.receita_link
+    if rel and not rel.startswith('/'):
+        rel = f'/api/uploads/{rel}'
+
+    minha_out = None
+    if minha:
+        minha_out = {
+            'id': minha.id,
+            'valor': float(minha.valor),
+            'status': minha.status_,
+            'data_criacao': minha.data_criacao.strftime('%d/%m/%Y %H:%M')
+                if minha.data_criacao else None,
+            'tempo_entrega_min': getattr(minha, 'tempo_entrega_min', None),
+        }
+
+    cliente_nome = _primeiro_nome(s.cliente.nome if s.cliente else '')
+
+    # Bucket de distância (PII-safe).
+    dist_bucket = None
+    cli_obj = s.cliente
+    if cli_obj is not None and cli_obj.latitude is not None and cli_obj.longitude is not None:
+        cook = db.query(Cozinheiro).filter(Cozinheiro.id == cozinheiro_id).first()
+        if cook is not None and cook.latitude is not None and cook.longitude is not None:
+            d = distancia_km(cli_obj.latitude, cli_obj.longitude, cook.latitude, cook.longitude)
+            dist_bucket = bucket_distancia_km(d)
+
+    return {
+        'id': s.id,
+        'cliente_id': s.cliente_id,
+        'cliente_nome': cliente_nome,
+        'situacao': getattr(s, 'situacao', None) or 'aguardando_cozinheiro',
+        'data': s.data_criacao.strftime('%d/%m/%Y') if s.data_criacao else '',
+        'hora': s.data_criacao.strftime('%H:%M') if s.data_criacao else '',
+        'criado_em_iso': s.data_criacao.isoformat() if s.data_criacao else None,
+        'refeicoes_por_dia': s.refeicoes_por_dia,
+        'calorias_diarias': s.calorias_diarias,
+        'restricoes': s.restricoes,
+        'alimentos_proibidos': s.alimentos_proibidos,
+        'observacoes_nutricionista': s.observacoes_nutricionista,
+        'qtd_dias': s.qtd_dias,
+        'porcoes_por_refeicao': s.porcoes_por_refeicao,
+        'observacoes_adicionais': s.observacoes_adicionais,
+        'receita_link': rel,
+        'ja_tem_proposta_minha': minha is not None,
+        'minha_proposta': minha_out,
+        'total_propostas': total_propostas,
+        'cliente_distancia_bucket': dist_bucket,
+    }
+
+
+def _parse_bool(v, default=False):
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ('1', 'true', 'yes', 'sim', 'on')
+
+
+@app.route('/api/solicitacoes/abertas', methods=['GET'])
+def listar_solicitacoes_abertas():
+    """Lista solicitações em `aguardando_cozinheiro` para o cozinheiro logado.
+
+    Query params (todos opcionais):
+      - q: busca textual em restricoes, alimentos_proibidos, observacoes_*.
+      - min_refeicoes / max_refeicoes: faixa de refeicoes_por_dia.
+      - min_calorias / max_calorias: faixa de calorias_diarias.
+      - somente_sem_proposta_minha: default 'true'. Oculta solicitações
+        em que o próprio cozinheiro já enviou proposta (pendente).
+      - limit (<=100, default 50), offset (default 0).
+    """
+    if 'usuario_id' not in session or session.get('usuario_tipo') != 'cozinheiro':
+        return jsonify({'error': 'Não autorizado'}), 401
+
+    cozinheiro_id = session['usuario_id']
+    q = (request.args.get('q') or '').strip()
+    min_ref = _safe_int(request.args.get('min_refeicoes'))
+    max_ref = _safe_int(request.args.get('max_refeicoes'))
+    min_cal = _safe_int(request.args.get('min_calorias'))
+    max_cal = _safe_int(request.args.get('max_calorias'))
+    somente_sem = _parse_bool(request.args.get('somente_sem_proposta_minha'), default=True)
+    limit = _safe_int(request.args.get('limit'), default=50) or 50
+    offset = _safe_int(request.args.get('offset'), default=0) or 0
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+
+    db = SessionLocal()
+    try:
+        query = (
+            db.query(Solicitacao)
+            .filter(Solicitacao.situacao == 'aguardando_cozinheiro')
+        )
+
+        # Defesa-em-profundidade: exclui qualquer solicitação com proposta já aceita.
+        aceitas_subq = (
+            db.query(Proposta.solicitacao_id)
+            .filter(Proposta.status_ == 1)
+            .subquery()
+        )
+        query = query.filter(~Solicitacao.id.in_(aceitas_subq))
+
+        if somente_sem:
+            minhas_subq = (
+                db.query(Proposta.solicitacao_id)
+                .filter(Proposta.cozinheiro_id == cozinheiro_id)
+                .subquery()
+            )
+            query = query.filter(~Solicitacao.id.in_(minhas_subq))
+
+        if min_ref is not None:
+            query = query.filter(Solicitacao.refeicoes_por_dia >= min_ref)
+        if max_ref is not None:
+            query = query.filter(Solicitacao.refeicoes_por_dia <= max_ref)
+        if min_cal is not None:
+            query = query.filter(Solicitacao.calorias_diarias >= min_cal)
+        if max_cal is not None:
+            query = query.filter(Solicitacao.calorias_diarias <= max_cal)
+
+        if q:
+            like = f'%{q}%'
+            query = query.filter(or_(
+                Solicitacao.restricoes.ilike(like),
+                Solicitacao.alimentos_proibidos.ilike(like),
+                Solicitacao.observacoes_nutricionista.ilike(like),
+                Solicitacao.observacoes_adicionais.ilike(like),
+            ))
+
+        total = query.count()
+        sols = (
+            query.order_by(Solicitacao.data_criacao.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        out = [_serialize_solicitacao_aberta(s, db, cozinheiro_id) for s in sols]
+        return jsonify({
+            'solicitacoes': out,
+            'total': total,
+            'limit': limit,
+            'offset': offset,
+        })
+    except Exception as e:
+        print(f'Erro listar solicitacoes abertas: {e}')
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/solicitacoes/<int:solicitacao_id>', methods=['GET'])
+def obter_solicitacao(solicitacao_id):
+    """Detalhe de uma solicitação.
+
+    - Cozinheiro logado → view de descoberta (sem PII sensível), com
+      `minha_proposta` quando já tiver respondido.
+    - Cliente logado dono da solicitação → view completa (mesmo schema
+      usado em `/api/cliente/home-pedidos`).
+    """
+    if 'usuario_id' not in session:
+        return jsonify({'error': 'Não autorizado'}), 401
+
+    tipo = session.get('usuario_tipo')
+    uid = session['usuario_id']
+
+    db = SessionLocal()
+    try:
+        s = db.query(Solicitacao).filter(Solicitacao.id == solicitacao_id).first()
+        if not s:
+            return jsonify({'error': 'Solicitação não encontrada'}), 404
+
+        if tipo == 'cliente':
+            if s.cliente_id != uid:
+                return jsonify({'error': 'Não autorizado'}), 403
+            return jsonify(_serialize_solicitacao_cliente(s, db))
+
+        if tipo == 'cozinheiro':
+            return jsonify(_serialize_solicitacao_aberta(s, db, uid))
+
+        return jsonify({'error': 'Não autorizado'}), 401
+    except Exception as e:
+        print(f'Erro obter solicitacao: {e}')
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
     finally:
         db.close()
 
@@ -1988,7 +2796,13 @@ def delete_solicitacao(solicitacao_id):
 
 @app.route('/api/pedidos/<int:pedido_id>/cliente', methods=['DELETE'])
 def delete_pedido_cliente(pedido_id):
-    """Cliente remove pedido ativo."""
+    """Cliente remove pedido ativo.
+
+    Regra (PLAN_USUARIO §13): bloqueia a remoção enquanto o pedido está
+    em execução (`preparando` ou `saiu_entrega`). Nos demais estados —
+    `confirmado` (ainda não iniciado), `entregue` e `cancelado` — o
+    cliente pode limpar da lista.
+    """
     if 'usuario_id' not in session or session.get('usuario_tipo') != 'cliente':
         return jsonify({'success': False, 'error': 'Não autorizado'}), 401
 
@@ -1997,9 +2811,213 @@ def delete_pedido_cliente(pedido_id):
         p = db.query(Pedido).filter(Pedido.id == pedido_id).first()
         if not p or p.cliente_id != session['usuario_id']:
             return jsonify({'success': False, 'error': 'Pedido não encontrado'}), 404
+        if (p.status or '') in ('preparando', 'saiu_entrega'):
+            return jsonify({
+                'success': False,
+                'error': 'Pedido em preparo ou a caminho não pode ser cancelado.',
+                'code': 'pedido_em_execucao',
+            }), 409
         db.delete(p)
         db.commit()
         return jsonify({'success': True})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+# ============ API: CHECKOUT FAKE (PLAN_USUARIO §12) ============
+_METODOS_PAGAMENTO_VALIDOS = {'pix', 'credito', 'debito'}
+
+
+def _gerar_pix_copia_cola_fake(pedido) -> str:
+    """Gera um EMV-ish determinístico para o pedido.
+
+    Não é um BR Code válido — serve apenas para a UI copiar/colar e
+    aparentar um PIX real no fluxo de demo.
+    """
+    import secrets
+    token = secrets.token_hex(8).upper()
+    valor = f"{float(pedido.val_total or 0):.2f}"
+    return (
+        f"00020126360014BR.GOV.BCB.PIX0114NUTRISYNC{pedido.id:06d}"
+        f"5204000053039865406{valor}5802BR5913NutriSync FAKE"
+        f"6009SAO PAULO62070503***6304{token[:4]}"
+    )
+
+
+def _serialize_pagamento(p) -> dict:
+    return {
+        'pedido_id': p.id,
+        'status_pagamento': p.status_pagamento or 'pendente',
+        'metodo_pagamento': p.metodo_pagamento,
+        'pix_copia_cola': p.pix_copia_cola,
+        'pagamento_data': p.pagamento_data.isoformat() if p.pagamento_data else None,
+        'valor': float(p.val_total or 0),
+    }
+
+
+@app.route('/api/pedidos/<int:pedido_id>/pagamento', methods=['GET'])
+def pagamento_status(pedido_id):
+    """Snapshot do pagamento — usado pelo polling do checkout."""
+    if 'usuario_id' not in session or session.get('usuario_tipo') != 'cliente':
+        return jsonify({'success': False, 'error': 'Não autorizado'}), 401
+    db = SessionLocal()
+    try:
+        p = db.query(Pedido).filter(Pedido.id == pedido_id).first()
+        if not p or p.cliente_id != session['usuario_id']:
+            return jsonify({'success': False, 'error': 'Pedido não encontrado'}), 404
+        return jsonify({'success': True, 'pagamento': _serialize_pagamento(p)})
+    finally:
+        db.close()
+
+
+@app.route('/api/pedidos/<int:pedido_id>/pagamento/iniciar', methods=['POST'])
+def pagamento_iniciar(pedido_id):
+    """Prepara o pagamento fake (seleciona método e, se PIX, gera código).
+
+    É idempotente para PIX: se já existe `pix_copia_cola` o valor é
+    reaproveitado — permite ao cliente fechar e reabrir o checkout sem
+    gerar um novo código.
+    """
+    if 'usuario_id' not in session or session.get('usuario_tipo') != 'cliente':
+        return jsonify({'success': False, 'error': 'Não autorizado'}), 401
+
+    data = request.get_json(silent=True) or {}
+    metodo = (data.get('metodo') or '').strip().lower()
+    if metodo not in _METODOS_PAGAMENTO_VALIDOS:
+        return jsonify({'success': False, 'error': 'Método inválido.'}), 400
+
+    db = SessionLocal()
+    try:
+        p = db.query(Pedido).filter(Pedido.id == pedido_id).first()
+        if not p or p.cliente_id != session['usuario_id']:
+            return jsonify({'success': False, 'error': 'Pedido não encontrado'}), 404
+        if (p.status_pagamento or 'pendente') == 'pago':
+            return jsonify({'success': True, 'pagamento': _serialize_pagamento(p)})
+        p.metodo_pagamento = metodo
+        if metodo == 'pix' and not p.pix_copia_cola:
+            p.pix_copia_cola = _gerar_pix_copia_cola_fake(p)
+        db.commit()
+        db.refresh(p)
+        return jsonify({'success': True, 'pagamento': _serialize_pagamento(p)})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/pedidos/<int:pedido_id>/pagamento/confirmar', methods=['POST'])
+def pagamento_confirmar(pedido_id):
+    """Confirma o pagamento fake.
+
+    Para cartão, exige os quatro campos básicos (número 13–19, validade
+    MM/AA, CVV 3–4, titular) — só para validar a forma; nada é enviado
+    a nenhum gateway. Para PIX, o botão "Já paguei" dispara esta mesma
+    rota com `metodo='pix'` e sem `cartao`.
+    """
+    if 'usuario_id' not in session or session.get('usuario_tipo') != 'cliente':
+        return jsonify({'success': False, 'error': 'Não autorizado'}), 401
+
+    data = request.get_json(silent=True) or {}
+    metodo = (data.get('metodo') or '').strip().lower()
+    if metodo not in _METODOS_PAGAMENTO_VALIDOS:
+        return jsonify({'success': False, 'error': 'Método inválido.'}), 400
+
+    if metodo in ('credito', 'debito'):
+        cartao = data.get('cartao') or {}
+        numero = ''.join(ch for ch in str(cartao.get('numero', '')) if ch.isdigit())
+        cvv = ''.join(ch for ch in str(cartao.get('cvv', '')) if ch.isdigit())
+        validade = str(cartao.get('validade', '')).strip()
+        titular = str(cartao.get('titular', '')).strip()
+        if not (13 <= len(numero) <= 19):
+            return jsonify({'success': False, 'error': 'Número do cartão inválido.', 'field': 'numero'}), 400
+        if not (3 <= len(cvv) <= 4):
+            return jsonify({'success': False, 'error': 'CVV inválido.', 'field': 'cvv'}), 400
+        # MM/AA — aceita com ou sem barra.
+        v = validade.replace('/', '').replace(' ', '')
+        if len(v) != 4 or not v.isdigit() or not (1 <= int(v[:2]) <= 12):
+            return jsonify({'success': False, 'error': 'Validade inválida.', 'field': 'validade'}), 400
+        if len(titular) < 2:
+            return jsonify({'success': False, 'error': 'Informe o nome do titular.', 'field': 'titular'}), 400
+
+    db = SessionLocal()
+    try:
+        p = db.query(Pedido).filter(Pedido.id == pedido_id).first()
+        if not p or p.cliente_id != session['usuario_id']:
+            return jsonify({'success': False, 'error': 'Pedido não encontrado'}), 404
+        p.metodo_pagamento = metodo
+        p.status_pagamento = 'pago'
+        p.pagamento_data = datetime.now()
+        db.commit()
+        db.refresh(p)
+        return jsonify({'success': True, 'pagamento': _serialize_pagamento(p)})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+# ============ API: AVALIAR PEDIDO (alias do frontend) ============
+@app.route('/api/pedidos/<int:pedido_id>/avaliar', methods=['POST'])
+def avaliar_pedido(pedido_id):
+    """Alias de `POST /api/avaliacoes` consumido pelo frontend.
+
+    Aceita `{ avaliacao: 1..5 }` (nomenclatura do cliente RN) e
+    delega para a lógica canônica via um mock mínimo de `request.json`.
+    Mantém a média do cozinheiro consistente (a base é `Pedido.avaliacao`
+    direto — cada pedido entregue entra com sua nota; média é recalculada
+    em tempo real).
+    """
+    if 'usuario_id' not in session:
+        return jsonify({'error': 'Usuário não logado'}), 401
+
+    data = request.get_json(silent=True) or {}
+    try:
+        nota = int(data.get('avaliacao'))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Nota inválida. Deve ser entre 1 e 5'}), 400
+    if nota < 1 or nota > 5:
+        return jsonify({'success': False, 'error': 'Nota inválida. Deve ser entre 1 e 5'}), 400
+
+    db = SessionLocal()
+    try:
+        pedido = db.query(Pedido).filter(Pedido.id == pedido_id).first()
+        if not pedido:
+            return jsonify({'success': False, 'error': 'Pedido não encontrado'}), 404
+        if session['usuario_id'] != pedido.cliente_id:
+            return jsonify({'success': False, 'error': 'Não autorizado'}), 401
+        if pedido.status != 'entregue':
+            return jsonify({'success': False, 'error': 'Apenas pedidos entregues podem ser avaliados'}), 400
+        if (pedido.avaliacao or 0) > 0:
+            return jsonify({'success': False, 'error': 'Este pedido já foi avaliado'}), 400
+
+        pedido.avaliacao = nota
+        db.commit()
+
+        from sqlalchemy import func as _f
+        media = db.query(_f.avg(Pedido.avaliacao)).filter(
+            Pedido.cozinheiro_id == pedido.cozinheiro_id,
+            Pedido.avaliacao > 0,
+        ).scalar() or 0
+        cozinheiro = db.query(Cozinheiro).filter(Cozinheiro.id == pedido.cozinheiro_id).first()
+        if cozinheiro:
+            cozinheiro.avaliacao = int(round(float(media)))
+            db.commit()
+        total = db.query(Pedido).filter(
+            Pedido.cozinheiro_id == pedido.cozinheiro_id,
+            Pedido.avaliacao > 0,
+        ).count()
+        return jsonify({
+            'success': True,
+            'pedido_id': pedido.id,
+            'nota': nota,
+            'media_cozinheiro': float(media),
+            'total_avaliacoes': total,
+        })
     except Exception as e:
         db.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
