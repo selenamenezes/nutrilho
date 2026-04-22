@@ -1,10 +1,7 @@
 from database import Base
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, DECIMAL
+from sqlalchemy import Boolean, Column, Integer, String, DateTime, ForeignKey, Text, DECIMAL
 from sqlalchemy.orm import relationship
 from datetime import datetime
-
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, DECIMAL
-from sqlalchemy.orm import relationship
 
 class Especialidade(Base):
     __tablename__ = "especialidades"
@@ -32,7 +29,19 @@ class Cozinheiro(Base):
     sobre_voce = Column(Text)
     avaliacao = Column(Integer, default=0)
     tipo_entrega = Column(String(100))
-    
+    # Configuração de entrega (PLAN_USUARIO §9.2)
+    # NULL em taxa_motoboy = cozinheiro não oferece moto-boy próprio.
+    taxa_motoboy = Column(DECIMAL(8, 2), nullable=True)
+    aceita_parceiros = Column(Boolean, default=False, nullable=False)
+    taxa_parceiros = Column(DECIMAL(8, 2), nullable=True)
+    # Geo (PLAN §10/§11). Populado a partir de BrasilAPI com base no CEP; é
+    # invalidado (refetch) quando o CEP muda. `geo_cep_ref` guarda o CEP
+    # normalizado usado na última consulta p/ evitar refetch desnecessário.
+    latitude = Column(DECIMAL(10, 7), nullable=True)
+    longitude = Column(DECIMAL(10, 7), nullable=True)
+    geo_cep_ref = Column(String(16), nullable=True)
+    geo_atualizado_em = Column(DateTime, nullable=True)
+
     especialidade = relationship("Especialidade", back_populates="cozinheiros")
     propostas = relationship("Proposta", back_populates="cozinheiro")
     marmitas = relationship("Marmita", back_populates="cozinheiro")
@@ -51,7 +60,13 @@ class Cliente(Base):
     complemento = Column(String(255))
     numero = Column(Integer, nullable=False)
     restricao = Column(Text)
-    
+    # Geo (PLAN §10/§11). Mesmos fields do Cozinheiro, mantidos NULL em
+    # contas antigas até o CEP ser salvo/atualizado novamente.
+    latitude = Column(DECIMAL(10, 7), nullable=True)
+    longitude = Column(DECIMAL(10, 7), nullable=True)
+    geo_cep_ref = Column(String(16), nullable=True)
+    geo_atualizado_em = Column(DateTime, nullable=True)
+
     pedidos = relationship("Pedido", back_populates="cliente")
     solicitacoes = relationship("Solicitacao", back_populates="cliente")
 
@@ -81,8 +96,11 @@ class Proposta(Base):
     status_ = Column(Integer, default=0, nullable =False)
     data_criacao = Column(DateTime, default=datetime.now)
     data_aceita = Column(DateTime, nullable=True)
-    
-    # Relacionamentos
+    data_resposta = Column(DateTime, nullable=True)
+    # Tempo prometido pelo cozinheiro para entrega via moto-boy (5..240 min).
+    # NULL = não aplicável (cozinheiro não oferece moto-boy).
+    tempo_entrega_min = Column(Integer, nullable=True)
+
     cozinheiro = relationship("Cozinheiro", back_populates="propostas")
     solicitacao = relationship("Solicitacao", back_populates="propostas")
     pedidos = relationship("Pedido", back_populates="proposta")
@@ -140,6 +158,20 @@ class Pedido(Base):
     avaliacao = Column(Integer, default=0)
     proposta_id = Column(Integer, ForeignKey("proposta.id"))
     marmita_id = Column(Integer, ForeignKey("marmitas.id"))
+    # Entrega escolhida pelo cliente no aceite (PLAN_USUARIO §9.2).
+    # id ∈ {retirada, motoboy, uber, parceiros}. NULL em pedidos legados.
+    entrega_opcao = Column(String(32), nullable=True)
+    taxa_entrega = Column(DECIMAL(8, 2), nullable=True)
+    # Replicado da Proposta apenas quando entrega_opcao == 'motoboy'.
+    tempo_entrega_min = Column(Integer, nullable=True)
+    # Pagamento fake (PLAN_USUARIO §12). `status_pagamento` ∈
+    # {pendente, pago, falhou}. `metodo_pagamento` ∈ {pix, credito, debito}.
+    # `pix_copia_cola` guarda o EMV fake gerado no "iniciar" p/ idempotência
+    # quando o cliente volta ao checkout antes de pagar.
+    status_pagamento = Column(String(16), default='pendente', nullable=False)
+    metodo_pagamento = Column(String(16), nullable=True)
+    pix_copia_cola = Column(String(255), nullable=True)
+    pagamento_data = Column(DateTime, nullable=True)
     
     cozinheiro = relationship("Cozinheiro", back_populates="pedidos")
     cliente = relationship("Cliente", back_populates="pedidos")
